@@ -160,11 +160,12 @@ export function updateEventStatus(id: string, status: EventStatus, expectedVersi
   return clone(event);
 }
 
-function activeAttempt(exportId: string) { return exportAttempts.filter((item) => item.exportId === exportId).sort((a, b) => b.attempt - a.attempt)[0]; }
+function isTerminalExportStatus(status: ExportJob['status']) { return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED'; }
 function transitionExport(exportId: string, generation: string, status: ExportJob['status'], progress: number, records: number, error?: string) {
   const job = exports.find((item) => item.id === exportId);
   const attempt = exportAttempts.find((item) => item.exportId === exportId && item.generation === generation);
   if (!job || !attempt || job.activeAttempt !== attempt.attempt || attempt.generation !== generation) return;
+  if (isTerminalExportStatus(attempt.status)) return;
   job.status = status; job.progress = progress; job.records = records; job.failureReason = error;
   attempt.status = status; attempt.progress = progress; attempt.records = records;
   if (status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') attempt.finishedAt = now();
@@ -203,27 +204,37 @@ export function retryExport(exportId: string, requestedBy = 'system') {
 export function cancelExport(exportId: string) {
   const job = exports.find((item) => item.id === exportId);
   if (!job) return undefined;
-  if (job.status === 'COMPLETED') return clone(job);
-  const currentAttempt = activeAttempt(exportId);
+  if (job.status === 'COMPLETED' || job.status === 'CANCELLED') return clone(job);
+  const cancelledAt = now();
+  const currentAttempt = exportAttempts.find((item) => item.exportId === exportId && item.attempt === job.activeAttempt);
   if (!currentAttempt) {
     job.status = 'CANCELLED';
     job.failureReason = 'cancelled without active attempt';
     return clone(job);
   }
+  const cancelledGeneration = currentAttempt.generation;
+  if (!isTerminalExportStatus(currentAttempt.status)) {
+    currentAttempt.status = 'CANCELLED';
+    currentAttempt.progress = Math.min(currentAttempt.progress, 99);
+    currentAttempt.finishedAt = cancelledAt;
+  }
+  // Rotate the generation so async callbacks already queued for the old
+  // generation can no longer resolve to a writable attempt.
+  currentAttempt.generation = `${cancelledGeneration}:cancelled:${randomUUID().slice(0, 8)}`;
   job.status = 'CANCELLED';
   job.progress = Math.min(job.progress, 99);
   job.failureReason = 'cancelled by user';
   appendOutbox(job.id, 'EXPORT_JOB', 'EXPORT_CANCELLED', currentAttempt.attempt, {
     exportId,
     attempt: currentAttempt.attempt,
-    generation: currentAttempt.generation,
+    generation: cancelledGeneration,
     records: job.records,
     progress: job.progress,
   });
   if (job.snapshotId) {
     appendTimelineForExport(job, 'EXPORT_CANCEL_REQUESTED', {
       snapshotId: job.snapshotId,
-      requestedAt: now(),
+      requestedAt: cancelledAt,
     });
   }
   return clone(job);
